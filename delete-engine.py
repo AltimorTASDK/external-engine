@@ -3,8 +3,10 @@
 import argparse
 import logging
 import os
-import requests
 import sys
+
+import requests
+
 
 def ok(res):
     try:

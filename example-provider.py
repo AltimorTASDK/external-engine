@@ -3,15 +3,20 @@
 """External engine provider example for lichess.org"""
 
 import argparse
+import contextlib
+import json
 import logging
-import requests
-import sys
+import multiprocessing
 import os
+import re
 import secrets
 import subprocess
-import multiprocessing
-import contextlib
+import sys
 import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
 
 
 def ok(res):
@@ -54,37 +59,54 @@ def main(args):
     http.headers["Authorization"] = f"Bearer {args.token}"
     secret = register_engine(args, http)
 
-    backoff = 1
-    while True:
-        try:
-            res = ok(http.post(f"{args.broker}/api/external-engine/work", json={"providerSecret": secret}))
-            if res.status_code != 200:
-                if engine is not None and engine.idle_time() > args.keep_alive:
-                    logging.info("Terminating idle engine")
-                    engine.terminate()
-                    engine = None
-                continue
-            job = res.json()
-        except requests.exceptions.RequestException as err:
-            logging.error("Error while trying to acquire work: %s", err)
-            time.sleep(backoff)
-            backoff = min(backoff * 1.5, 10)
-            continue
-        else:
-            backoff = 1
+    def request_handler(*args, **kwargs):
+        return EngineRequestHandler(*args, **kwargs, engine=engine)
+
+    server = HTTPServer(("", 9666), request_handler)
+    server.serve_forever()
+
+
+class EngineRequestHandler(BaseHTTPRequestHandler):
+    PATH_REGEX = re.compile(r"/api/external-engine/[^/]+/analyse")
+
+    def __init__(self, *args, engine, **kwargs):
+        self.engine = engine
+        super().__init__(*args, **kwargs)
+
+    def do_OPTIONS(self):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Allow-Headers", "Content-Length, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "*")
+        self.end_headers()
+
+    def do_POST(self):
+        if not self.PATH_REGEX.fullmatch(self.path):
+            logging.warning(f"Received unknown API request {self.path}")
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
 
         try:
-            logging.info("Handling job %s", job["id"])
-            if engine is None:
-                engine = Engine(args)
-            with engine.analyse(job) as analysis_stream:
-                ok(http.post(f"{args.broker}/api/external-engine/work/{job['id']}", data=analysis_stream))
-        except requests.exceptions.ConnectionError:
-            logging.info("Connection closed while streaming analysis")
-        except EOFError:
-            logging.exception("Engine died")
-            engine = None
-            time.sleep(5)
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            logging.warning("Invalid Content-Length header")
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return
+
+        job = json.loads(self.rfile.read(length))
+        logging.info(job)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        with self.engine.analyse(job) as analysis_stream:
+            for line in analysis_stream:
+                self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
+
+        self.wfile.write(b"0\r\n\r\n")
 
 
 class Engine:
@@ -102,6 +124,9 @@ class Engine:
 
     def idle_time(self):
         return time.monotonic() - self.last_used
+
+    def millis(self):
+        return round(self.idle_time() * 1000)
 
     def terminate(self):
         self.process.terminate()
@@ -218,4 +243,7 @@ if __name__ == "__main__":
         print(f"Need LICHESS_API_TOKEN environment variable from {args.lichess}/account/oauth/token/create?scopes[]=engine:read&scopes[]=engine:write")
         sys.exit(128)
 
-    main(args)
+    try:
+        main(args)
+    except KeyboardInterrupt:
+        pass

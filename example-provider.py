@@ -269,13 +269,14 @@ class Engine:
                         break
                     command, params = self.recv_uci()
 
-                if command == "bestmove":
-                    break
-                elif command == "info":
-                    if "score" in params:
-                        yield command + " " + params + "\r\n"
-                else:
-                    logging.warning("Unexpected engine command: %s", command)
+                match command:
+                    case "bestmove":
+                        break
+                    case "info":
+                        if "score" in params:
+                            yield f"{command} {params}\r\n"
+                    case _:
+                        logging.warning("Unexpected engine command: %s", command)
 
         analysis = stream()
         try:

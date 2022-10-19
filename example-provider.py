@@ -12,9 +12,11 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 import requests
 
@@ -62,8 +64,12 @@ def main(args):
     def request_handler(*args, **kwargs):
         return EngineRequestHandler(*args, **kwargs, engine=engine)
 
-    server = HTTPServer(("", 9666), request_handler)
+    server = ThreadedHTTPServer(("", 9666), request_handler)
     server.serve_forever()
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
 
 
 class EngineRequestHandler(BaseHTTPRequestHandler):
@@ -110,12 +116,10 @@ class EngineRequestHandler(BaseHTTPRequestHandler):
         self.analysis = {
             "time": 0,
             "nodes": 0,
-            "pvs": [
-                {
-                    "depth": 0,
-                    "moves": []
-                }
-            ] * job["work"]["multiPv"]
+            "pvs": [{
+                "depth": 0,
+                "moves": []
+            }] * job["work"]["multiPv"]
         }
 
         self.send_response(HTTPStatus.OK)
@@ -130,8 +134,7 @@ class EngineRequestHandler(BaseHTTPRequestHandler):
                 try:
                     self.wfile.write(response.encode())
                 except ConnectionAbortedError:
-                    self.engine.stop()
-                    return
+                    break
 
     def check_if_black(self, job):
         work = job["work"]
@@ -171,6 +174,8 @@ class Engine:
         self.hash = None
         self.threads = None
         self.last_used = time.monotonic()
+        self.lock = threading.Lock()
+        self.owner_uid = None
 
         self.uci()
         self.setoption("UCI_AnalyseMode", "true")
@@ -180,10 +185,14 @@ class Engine:
         return time.monotonic() - self.last_used
 
     def terminate(self):
+        logging.info("Terminating engine")
         self.process.terminate()
 
     def stop(self):
+        logging.info("Stopping engine")
         self.send("stop")
+        while self.recv_uci()[0] != "bestmove":
+            pass
 
     def send(self, command):
         logging.debug("%d << %s", self.process.pid, command)
@@ -227,28 +236,39 @@ class Engine:
 
     @contextlib.contextmanager
     def analyse(self, job):
-        work = job["work"]
+        with self.lock:
+            if self.owner_uid is not None:
+                # Take over the engine
+                self.stop()
 
-        if work["sessionId"] != self.session:
-            self.session = work["sessionId"]
-            self.send("ucinewgame")
+            work = job["work"]
+            uid = object()
+            self.owner_uid = uid
+
+            if work["sessionId"] != self.session:
+                self.session = work["sessionId"]
+                self.send("ucinewgame")
+                self.isready()
+
+            if self.threads != work["threads"]:
+                self.setoption("Threads", work["threads"])
+                self.threads = work["threads"]
+            if self.hash != work["hash"]:
+                self.setoption("Hash", work["hash"])
+                self.hash = work["hash"]
+            self.setoption("MultiPV", work["multiPv"])
             self.isready()
 
-        if self.threads != work["threads"]:
-            self.setoption("Threads", work["threads"])
-            self.threads = work["threads"]
-        if self.hash != work["hash"]:
-            self.setoption("Hash", work["hash"])
-            self.hash = work["hash"]
-        self.setoption("MultiPV", work["multiPv"])
-        self.isready()
-
-        self.send(f"position fen {work['initialFen']} moves {' '.join(work['moves'])}")
-        self.send(f"go depth {self.args.deep_depth if work['deep'] else self.args.shallow_depth}")
+            self.send(f"position fen {work['initialFen']} moves {' '.join(work['moves'])}")
+            self.send(f"go depth {self.args.deep_depth if work['deep'] else self.args.shallow_depth}")
 
         def stream():
             while True:
-                command, params = self.recv_uci()
+                with self.lock:
+                    if self.owner_uid is not uid:
+                        break
+                    command, params = self.recv_uci()
+
                 if command == "bestmove":
                     break
                 elif command == "info":
@@ -261,9 +281,10 @@ class Engine:
         try:
             yield analysis
         finally:
-            self.send("stop")
-            for _ in analysis:
-                pass
+            with self.lock:
+                if self.owner_uid is uid:
+                    self.stop()
+                    self.owner_uid = None
 
         self.last_used = time.monotonic()
 

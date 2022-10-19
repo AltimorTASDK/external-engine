@@ -176,6 +176,7 @@ class Engine:
         self.last_used = time.monotonic()
         self.lock = threading.Lock()
         self.owner_uid = None
+        self.analysis = iter(())
 
         self.uci()
         self.setoption("UCI_AnalyseMode", "true")
@@ -191,7 +192,7 @@ class Engine:
     def stop(self):
         logging.info("Stopping engine")
         self.send("stop")
-        while self.recv_uci()[0] != "bestmove":
+        for _ in self.analysis:
             pass
 
     def send(self, command):
@@ -278,9 +279,9 @@ class Engine:
                     case _:
                         logging.warning("Unexpected engine command: %s", command)
 
-        analysis = stream()
+        self.analysis = stream()
         try:
-            yield analysis
+            yield self.analysis
         finally:
             with self.lock:
                 if self.owner_uid is uid:

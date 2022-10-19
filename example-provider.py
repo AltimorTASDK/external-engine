@@ -264,12 +264,8 @@ class Engine:
             self.send(f"go depth {self.args.deep_depth if work['deep'] else self.args.shallow_depth}")
 
         def stream():
-            while True:
-                with self.lock:
-                    if self.owner_uid is not uid:
-                        break
-                    command, params = self.recv_uci()
-
+            while self.owner_uid is uid:
+                command, params = self.recv_uci()
                 match command:
                     case "bestmove":
                         break
@@ -281,7 +277,8 @@ class Engine:
 
         self.analysis = stream()
         try:
-            yield self.analysis
+            with self.lock:
+                yield self.analysis
         finally:
             with self.lock:
                 if self.owner_uid is uid:

@@ -59,7 +59,7 @@ def main(args):
     engine = Engine(args)
     http = requests.Session()
     http.headers["Authorization"] = f"Bearer {args.token}"
-    secret = register_engine(args, http)
+    register_engine(args, http)
 
     def request_handler(*args, **kwargs):
         return EngineRequestHandler(*args, **kwargs, engine=engine)
@@ -170,13 +170,19 @@ class Engine:
     def __init__(self, args):
         self.process = subprocess.Popen(args.engine, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1, universal_newlines=True)
         self.args = args
-        self.session = None
-        self.hash = None
-        self.threads = None
         self.last_used = time.monotonic()
         self.lock = threading.Lock()
         self.owner_uid = None
         self.analysis = iter(())
+
+        self.lastWork = {
+            "sessionId": None,
+            "threads": None,
+            "hash": None,
+            "multiPv": None,
+            "initialFen": None,
+            "moves": None
+        }
 
         self.uci()
         self.setoption("UCI_AnalyseMode", "true")
@@ -192,8 +198,7 @@ class Engine:
     def stop(self):
         logging.info("Stopping engine")
         self.send("stop")
-        for _ in self.analysis:
-            pass
+        self.isready()
 
     def send(self, command):
         logging.debug("%d << %s", self.process.pid, command)
@@ -246,28 +251,35 @@ class Engine:
             uid = object()
             self.owner_uid = uid
 
-            if work["sessionId"] != self.session:
-                self.session = work["sessionId"]
+            if self.lastWork["sessionId"] != work["sessionId"]:
                 self.send("ucinewgame")
                 self.isready()
-
-            if self.threads != work["threads"]:
+            if self.lastWork["threads"] != work["threads"]:
                 self.setoption("Threads", work["threads"])
-                self.threads = work["threads"]
-            if self.hash != work["hash"]:
+            if self.lastWork["hash"] != work["hash"]:
                 self.setoption("Hash", work["hash"])
-                self.hash = work["hash"]
-            self.setoption("MultiPV", work["multiPv"])
-            self.isready()
+            if self.lastWork["multiPv"] != work["multiPv"]:
+                self.setoption("MultiPV", work["multiPv"])
+            if self.lastWork["initialFen"] != work["initialFen"] or self.lastWork["moves"] != work["moves"]:
+                self.send(f"position fen {work['initialFen']} moves {' '.join(work['moves'])}")
 
-            self.send(f"position fen {work['initialFen']} moves {' '.join(work['moves'])}")
-            self.send(f"go depth {self.args.deep_depth if work['deep'] else self.args.shallow_depth}")
+            if work["deep"]:
+                self.send("go infinite")
+            else:
+                self.send(f"go depth {self.args.shallow_depth}")
+            self.lastWork = work
+            self.finished = False
 
         def stream():
-            while self.owner_uid is uid:
-                command, params = self.recv_uci()
+            while True:
+                with self.lock:
+                    if self.owner_uid is not uid:
+                        break
+                    command, params = self.recv_uci()
+
                 match command:
                     case "bestmove":
+                        self.finished = True
                         break
                     case "info":
                         if "score" in params:
@@ -277,12 +289,12 @@ class Engine:
 
         self.analysis = stream()
         try:
-            with self.lock:
-                yield self.analysis
+            yield self.analysis
         finally:
             with self.lock:
                 if self.owner_uid is uid:
-                    self.stop()
+                    if not self.finished:
+                        self.stop()
                     self.owner_uid = None
 
         self.last_used = time.monotonic()

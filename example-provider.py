@@ -94,20 +94,74 @@ class EngineRequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
 
-        job = json.loads(self.rfile.read(length))
+        body = self.rfile.read(length)
+
+        try:
+            job = json.loads(body)
+        except json.JSONDecodeError:
+            logging.warning("Invalid JSON:")
+            logging.warning(body)
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return
+
         logging.info(job)
+        self.black = self.check_if_black(job)
+
+        self.analysis = {
+            "time": 0,
+            "nodes": 0,
+            "pvs": [
+                {
+                    "depth": 0,
+                    "moves": []
+                }
+            ] * job["work"]["multiPv"]
+        }
 
         self.send_response(HTTPStatus.OK)
-        self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
 
         with self.engine.analyse(job) as analysis_stream:
             for line in analysis_stream:
-                self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
+                self.update_analysis(line)
+                response = json.dumps(self.analysis) + "\r\n"
+                try:
+                    self.wfile.write(response.encode())
+                except ConnectionAbortedError:
+                    self.engine.stop()
+                    return
 
-        self.wfile.write(b"0\r\n\r\n")
+    def check_if_black(self, job):
+        work = job["work"]
+        black = work["initialFen"].split()[1] == "b"
+        return black ^ (len(work["moves"]) % 2 == 1)
 
+    def update_analysis(self, line):
+        it = iter(line.split())
+        pv = {"depth": 0, "moves": []}
+        pv_index = 0
+        score_sign = -1 if self.black else 1
+
+        try:
+            if next(it) != "info":
+                return
+            while True:
+                match next(it):
+                    case "depth":      pv["depth"] = int(next(it))
+                    case "multipv":    pv_index = int(next(it)) - 1
+                    case "nodes":      self.analysis["nodes"] = int(next(it))
+                    case "time":       self.analysis["time"] = int(next(it))
+                    case "score":      key, pv[key] = (next(it), int(next(it)) * score_sign)
+                    case "upperbound": pass
+                    case "lowerbound": pass
+                    case "pv":         pv["moves"] += [*it]
+                    case _:            next(it)
+        except StopIteration:
+            pass
+
+        self.analysis["pvs"][pv_index] = pv
 
 class Engine:
     def __init__(self, args):
@@ -125,11 +179,11 @@ class Engine:
     def idle_time(self):
         return time.monotonic() - self.last_used
 
-    def millis(self):
-        return round(self.idle_time() * 1000)
-
     def terminate(self):
         self.process.terminate()
+
+    def stop(self):
+        self.send("stop")
 
     def send(self, command):
         logging.debug("%d << %s", self.process.pid, command)
@@ -199,7 +253,7 @@ class Engine:
                     break
                 elif command == "info":
                     if "score" in params:
-                        yield (command + " " + params + "\n").encode("utf-8")
+                        yield command + " " + params + "\r\n"
                 else:
                     logging.warning("Unexpected engine command: %s", command)
 

@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Restore localhost external engine analysis
+// @name         Direct external engine analysis requests to localhost
 // @author       Altimor
 // @match        https://lichess.org/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=lichess.org

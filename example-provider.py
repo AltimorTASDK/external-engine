@@ -25,7 +25,8 @@ def ok(res):
     try:
         res.raise_for_status()
     except requests.exceptions.HTTPError:
-        logging.exception("Response: %s", res.text)
+        logging.error("Response: %s", res.text)
+        raise
     return res
 
 
